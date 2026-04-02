@@ -8,10 +8,6 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
-
 
 # --------------------------------------------------
 # App config
@@ -48,10 +44,10 @@ with st.container():
         - CSV / HTML / Markdown / JSON exports
         - ZIP download of all generated outputs
 
-        **Current PDF mode on Cloud:**
-        - OCR is disabled intentionally
+        **Cloud-safe mode**
+        - Docling is loaded only when needed
+        - OCR is disabled for PDFs
         - best for text-based PDFs
-        - scanned PDFs may not extract well yet
         """
     )
 
@@ -105,13 +101,15 @@ def get_job_output_dir(file_path: Path) -> Path:
 
 
 @st.cache_resource
-def get_converter() -> DocumentConverter:
+def get_converter():
     """
-    Cached Docling converter.
-    Important for Streamlit Cloud:
-    - use writable artifacts directory
-    - disable OCR for now to avoid RapidOCR model write issues
+    Lazy-load Docling only when needed.
+    This prevents app startup crashes from killing the whole Streamlit page.
     """
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
     pdf_options = PdfPipelineOptions()
     pdf_options.do_ocr = False
     pdf_options.artifacts_path = ARTIFACTS_DIR
@@ -121,6 +119,17 @@ def get_converter() -> DocumentConverter:
             InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
         }
     )
+
+
+def check_docling_available() -> tuple[bool, str]:
+    """
+    Try importing Docling without crashing the whole app.
+    """
+    try:
+        from docling.document_converter import DocumentConverter  # noqa: F401
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 # --------------------------------------------------
@@ -216,7 +225,7 @@ def process_xlsx_with_pandas(file_path: Path, job_output_dir: Path) -> dict:
 # --------------------------------------------------
 # Docling processing
 # --------------------------------------------------
-def process_with_docling(file_path: Path, job_output_dir: Path, converter: DocumentConverter) -> dict:
+def process_with_docling(file_path: Path, job_output_dir: Path, converter) -> dict:
     result = {
         "file_name": file_path.name,
         "file_type": file_path.suffix.lower().replace(".", ""),
@@ -232,18 +241,15 @@ def process_with_docling(file_path: Path, job_output_dir: Path, converter: Docum
         conv_result = converter.convert(str(file_path))
         doc = conv_result.document
 
-        # Markdown export
         try:
             markdown_text = doc.export_to_markdown()
             result["preview_text"] = markdown_text
-
             md_path = job_output_dir / f"{file_path.stem}.md"
             write_text_file(md_path, markdown_text)
             result["output_files"].append(md_path)
         except Exception as e:
             result["errors"].append(f"Markdown export failed: {e}")
 
-        # JSON export
         try:
             if hasattr(doc, "export_to_dict"):
                 doc_dict = doc.export_to_dict()
@@ -258,7 +264,6 @@ def process_with_docling(file_path: Path, job_output_dir: Path, converter: Docum
         except Exception as e:
             result["errors"].append(f"JSON export failed: {e}")
 
-        # Tables
         tables = getattr(doc, "tables", []) or []
 
         for idx, table in enumerate(tables, start=1):
@@ -273,13 +278,11 @@ def process_with_docling(file_path: Path, job_output_dir: Path, converter: Docum
                 "columns": None,
             }
 
-            # Markdown
             try:
                 table_info["markdown"] = table.export_to_markdown()
             except Exception:
                 table_info["markdown"] = f"### Table {idx}"
 
-            # HTML
             try:
                 html_path = job_output_dir / f"{file_path.stem}_table_{idx}.html"
                 html_content = table.export_to_html()
@@ -289,7 +292,6 @@ def process_with_docling(file_path: Path, job_output_dir: Path, converter: Docum
             except Exception as e:
                 result["errors"].append(f"HTML export failed for table {idx}: {e}")
 
-            # DataFrame / CSV
             try:
                 df = table.export_to_dataframe()
                 table_info["dataframe"] = df
@@ -317,15 +319,39 @@ def process_with_docling(file_path: Path, job_output_dir: Path, converter: Docum
     return result
 
 
-# --------------------------------------------------
-# Router
-# --------------------------------------------------
-def process_file(file_path: Path, converter: DocumentConverter) -> dict:
+def process_file(file_path: Path):
     job_output_dir = get_job_output_dir(file_path)
     suffix = file_path.suffix.lower()
 
     if suffix == ".xlsx":
         return process_xlsx_with_pandas(file_path, job_output_dir)
+
+    ok, err = check_docling_available()
+    if not ok:
+        return {
+            "file_name": file_path.name,
+            "file_type": suffix.replace(".", ""),
+            "mode": "docling",
+            "status": "failed",
+            "preview_text": "",
+            "tables": [],
+            "output_files": [],
+            "errors": [f"Docling import failed before processing: {err}"],
+        }
+
+    try:
+        converter = get_converter()
+    except Exception as e:
+        return {
+            "file_name": file_path.name,
+            "file_type": suffix.replace(".", ""),
+            "mode": "docling",
+            "status": "failed",
+            "preview_text": "",
+            "tables": [],
+            "output_files": [],
+            "errors": [f"Docling converter initialization failed: {e}"],
+        }
 
     return process_with_docling(file_path, job_output_dir, converter)
 
@@ -340,6 +366,13 @@ with st.sidebar:
     st.markdown("---")
     st.info("Tip: Start with 3-5 real files from your own use case.")
     st.caption("PDF OCR is currently disabled for better Cloud compatibility.")
+
+    docling_ok, docling_err = check_docling_available()
+    if docling_ok:
+        st.success("Docling import check passed")
+    else:
+        st.error("Docling import check failed")
+        st.code(docling_err)
 
 
 # --------------------------------------------------
@@ -363,22 +396,18 @@ if process_clicked and uploaded_files:
     all_results = []
     all_output_files = []
 
-    converter = get_converter()
-
     progress_bar = st.progress(0, text="Preparing files...")
     status_placeholder = st.empty()
 
     total_files = len(uploaded_files)
 
-    # Save uploads
     for file in uploaded_files:
         saved_paths.append(save_uploaded_file(file))
 
-    # Process files
     for idx, file_path in enumerate(saved_paths, start=1):
         status_placeholder.info(f"Processing {idx}/{total_files}: {file_path.name}")
 
-        file_result = process_file(file_path, converter)
+        file_result = process_file(file_path)
         all_results.append(file_result)
         all_output_files.extend(file_result["output_files"])
 
@@ -386,9 +415,6 @@ if process_clicked and uploaded_files:
 
     status_placeholder.success("Processing completed.")
 
-    # --------------------------------------------------
-    # Summary metrics
-    # --------------------------------------------------
     total_tables = sum(len(r["tables"]) for r in all_results)
     success_count = sum(1 for r in all_results if r["status"] == "success")
     partial_count = sum(1 for r in all_results if r["status"] == "partial_success")
@@ -401,14 +427,10 @@ if process_clicked and uploaded_files:
     c3.metric("Successful", success_count)
     c4.metric("Partial / Failed", partial_count + failed_count)
 
-    # --------------------------------------------------
-    # Tabs
-    # --------------------------------------------------
     summary_tab, preview_tab, tables_tab, downloads_tab = st.tabs(
         ["Summary", "Preview", "Tables", "Downloads"]
     )
 
-    # ---------------- Summary tab ----------------
     with summary_tab:
         summary_rows = []
         for r in all_results:
@@ -421,8 +443,7 @@ if process_clicked and uploaded_files:
                 "Errors": len(r["errors"]),
             })
 
-        df_summary = pd.DataFrame(summary_rows)
-        st.dataframe(df_summary, use_container_width=True)
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
         for r in all_results:
             with st.expander(f"{r['file_name']} ({r['status']})"):
@@ -432,12 +453,10 @@ if process_clicked and uploaded_files:
                 else:
                     st.success("No issues reported.")
 
-    # ---------------- Preview tab ----------------
     with preview_tab:
         for r in all_results:
             with st.expander(f"Preview - {r['file_name']}", expanded=False):
                 preview = r["preview_text"] or "No preview available."
-
                 if not show_full_preview and len(preview) > max_preview_chars:
                     preview = preview[:max_preview_chars] + "\n\n...[truncated]"
 
@@ -448,7 +467,6 @@ if process_clicked and uploaded_files:
                     key=f"preview_{r['file_name']}"
                 )
 
-    # ---------------- Tables tab ----------------
     with tables_tab:
         any_tables = any(r["tables"] for r in all_results)
 
@@ -497,7 +515,6 @@ if process_clicked and uploaded_files:
                                     key=f"html_{r['file_name']}_{table['index']}"
                                 )
 
-    # ---------------- Downloads tab ----------------
     with downloads_tab:
         st.subheader("Download everything")
 
@@ -512,7 +529,6 @@ if process_clicked and uploaded_files:
         else:
             st.info("No generated outputs available.")
 
-        st.markdown("### Generated files")
         download_rows = []
         for r in all_results:
             for p in r["output_files"]:
