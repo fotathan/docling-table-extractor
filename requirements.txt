@@ -1,0 +1,5 @@
+streamlit
+docling
+pandas
+openpyxl
+xlsxwriter
