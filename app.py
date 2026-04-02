@@ -21,11 +21,9 @@ st.set_page_config(
 BASE_DIR = Path(".")
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
-ARTIFACTS_DIR = BASE_DIR / "docling_artifacts"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # --------------------------------------------------
@@ -48,6 +46,7 @@ with st.container():
         - Docling is loaded only when needed
         - OCR is disabled for PDFs
         - best for text-based PDFs
+        - custom artifacts path is not used
         """
     )
 
@@ -104,7 +103,10 @@ def get_job_output_dir(file_path: Path) -> Path:
 def get_converter():
     """
     Lazy-load Docling only when needed.
-    This prevents app startup crashes from killing the whole Streamlit page.
+    OCR is disabled for Streamlit Cloud stability.
+    Intentionally do NOT set a custom artifacts_path here,
+    because an incomplete local artifacts folder can trigger:
+    'Missing safe tensors file: docling_artifacts/model.safetensors'
     """
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -112,7 +114,6 @@ def get_converter():
 
     pdf_options = PdfPipelineOptions()
     pdf_options.do_ocr = False
-    pdf_options.artifacts_path = ARTIFACTS_DIR
 
     return DocumentConverter(
         format_options={
