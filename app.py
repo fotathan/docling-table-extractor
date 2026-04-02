@@ -8,7 +8,9 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
 
 
 # --------------------------------------------------
@@ -23,9 +25,11 @@ st.set_page_config(
 BASE_DIR = Path(".")
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
+ARTIFACTS_DIR = BASE_DIR / "docling_artifacts"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # --------------------------------------------------
@@ -43,6 +47,11 @@ with st.container():
         - table previews
         - CSV / HTML / Markdown / JSON exports
         - ZIP download of all generated outputs
+
+        **Current PDF mode on Cloud:**
+        - OCR is disabled intentionally
+        - best for text-based PDFs
+        - scanned PDFs may not extract well yet
         """
     )
 
@@ -93,6 +102,25 @@ def get_job_output_dir(file_path: Path) -> Path:
     job_dir = OUTPUT_DIR / file_path.stem
     job_dir.mkdir(parents=True, exist_ok=True)
     return job_dir
+
+
+@st.cache_resource
+def get_converter() -> DocumentConverter:
+    """
+    Cached Docling converter.
+    Important for Streamlit Cloud:
+    - use writable artifacts directory
+    - disable OCR for now to avoid RapidOCR model write issues
+    """
+    pdf_options = PdfPipelineOptions()
+    pdf_options.do_ocr = False
+    pdf_options.artifacts_path = ARTIFACTS_DIR
+
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
+        }
+    )
 
 
 # --------------------------------------------------
@@ -311,6 +339,7 @@ with st.sidebar:
     max_preview_chars = st.slider("Preview length", min_value=1000, max_value=15000, value=4000, step=500)
     st.markdown("---")
     st.info("Tip: Start with 3-5 real files from your own use case.")
+    st.caption("PDF OCR is currently disabled for better Cloud compatibility.")
 
 
 # --------------------------------------------------
@@ -334,7 +363,7 @@ if process_clicked and uploaded_files:
     all_results = []
     all_output_files = []
 
-    converter = DocumentConverter()
+    converter = get_converter()
 
     progress_bar = st.progress(0, text="Preparing files...")
     status_placeholder = st.empty()
