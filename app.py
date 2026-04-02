@@ -13,7 +13,7 @@ import streamlit as st
 # App config
 # --------------------------------------------------
 st.set_page_config(
-    page_title="Docling MVP Batch Uploader",
+    page_title="PDF/XLSX/DOCX Table Extractor",
     page_icon="📄",
     layout="wide"
 )
@@ -29,24 +29,24 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # --------------------------------------------------
 # UI header
 # --------------------------------------------------
-st.title("📄 Docling MVP - Batch Document & Table Extraction")
-st.caption("Upload PDF, DOCX, or XLSX files and extract text + tables in one place.")
+st.title("📄 PDF / XLSX / DOCX Table Extractor")
+st.caption("Upload PDF, XLSX, or DOCX files and extract text previews and tables.")
 
 with st.container():
     st.markdown(
         """
         **This MVP does:**
-        - PDF / DOCX via Docling
-        - XLSX via pandas fallback
+        - PDF via Camelot + PyPDF
+        - XLSX via pandas
+        - DOCX text + Word tables via python-docx
         - table previews
         - CSV / HTML / Markdown / JSON exports
         - ZIP download of all generated outputs
 
-        **Cloud-safe mode**
-        - Docling is loaded only when needed
-        - OCR is disabled for PDFs
-        - extra PDF AI steps are reduced where supported
-        - best for text-based PDFs on Streamlit Cloud
+        **Cloud-safe direction**
+        - no Docling
+        - no OCR
+        - best for text-based PDFs
         """
     )
 
@@ -99,66 +99,59 @@ def get_job_output_dir(file_path: Path) -> Path:
     return job_dir
 
 
-@st.cache_resource
-def get_converter():
-    """
-    Lazy-load Docling only when needed.
+def dataframe_to_markdown_fallback(df: pd.DataFrame, title: str) -> str:
+    lines = [f"### {title}", ""]
+    if df.empty:
+        lines.append("_Empty table_")
+        return "\n".join(lines)
 
-    Streamlit Cloud friendly settings:
-    - disable OCR
-    - disable heavy PDF model steps when those flags exist
-    - do NOT set a custom artifacts_path
-    """
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import PdfPipelineOptions
-    from docling.document_converter import DocumentConverter, PdfFormatOption
+    header = "| " + " | ".join(str(c) for c in df.columns) + " |"
+    sep = "| " + " | ".join(["---"] * len(df.columns)) + " |"
+    lines.extend([header, sep])
 
-    pdf_options = PdfPipelineOptions()
-    pdf_options.do_ocr = False
+    max_rows = min(len(df), 20)
+    for _, row in df.head(max_rows).iterrows():
+        lines.append("| " + " | ".join("" if pd.isna(v) else str(v) for v in row.tolist()) + " |")
 
-    # Different Docling versions expose slightly different option names.
-    # Turn off heavier model-based PDF steps when available.
-    if hasattr(pdf_options, "do_table_structure"):
-        pdf_options.do_table_structure = False
+    if len(df) > max_rows:
+        lines.append("")
+        lines.append(f"_Preview truncated. Total rows: {len(df)}_")
 
-    if hasattr(pdf_options, "do_layout_analysis"):
-        pdf_options.do_layout_analysis = False
-
-    if hasattr(pdf_options, "do_formula_enrichment"):
-        pdf_options.do_formula_enrichment = False
-
-    if hasattr(pdf_options, "generate_picture_images"):
-        pdf_options.generate_picture_images = False
-
-    if hasattr(pdf_options, "generate_table_images"):
-        pdf_options.generate_table_images = False
-
-    return DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
-        }
-    )
+    return "\n".join(lines)
 
 
-def check_docling_available() -> tuple[bool, str]:
-    """
-    Try importing Docling without crashing the whole app.
-    """
+def html_table_from_df(df: pd.DataFrame) -> str:
+    return df.to_html(index=False, border=0)
+
+
+# --------------------------------------------------
+# Availability checks
+# --------------------------------------------------
+def check_pdf_stack_available() -> tuple[bool, str]:
     try:
-        from docling.document_converter import DocumentConverter  # noqa: F401
+        import camelot  # noqa: F401
+        from pypdf import PdfReader  # noqa: F401
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def check_docx_stack_available() -> tuple[bool, str]:
+    try:
+        import docx  # noqa: F401
         return True, ""
     except Exception as e:
         return False, str(e)
 
 
 # --------------------------------------------------
-# XLSX fallback
+# XLSX processing
 # --------------------------------------------------
 def process_xlsx_with_pandas(file_path: Path, job_output_dir: Path) -> dict:
     result = {
         "file_name": file_path.name,
         "file_type": "xlsx",
-        "mode": "xlsx_pandas_fallback",
+        "mode": "xlsx_pandas",
         "status": "success",
         "preview_text": "",
         "tables": [],
@@ -185,21 +178,24 @@ def process_xlsx_with_pandas(file_path: Path, job_output_dir: Path) -> dict:
                 df = pd.read_excel(file_path, sheet_name=sheet_name)
 
                 csv_path = job_output_dir / f"{file_path.stem}_sheet_{idx}_{safe_filename(sheet_name)}.csv"
+                html_path = job_output_dir / f"{file_path.stem}_sheet_{idx}_{safe_filename(sheet_name)}.html"
+
                 df.to_csv(csv_path, index=False)
+                write_text_file(html_path, html_table_from_df(df))
 
                 table_info = {
                     "index": idx,
                     "name": sheet_name,
                     "dataframe": df,
                     "csv_path": csv_path,
-                    "html_path": None,
-                    "markdown": f"### Sheet {idx}: {sheet_name}",
+                    "html_path": html_path,
+                    "markdown": dataframe_to_markdown_fallback(df, f"Sheet {idx}: {sheet_name}"),
                     "rows": len(df),
                     "columns": len(df.columns),
                 }
 
                 result["tables"].append(table_info)
-                result["output_files"].append(csv_path)
+                result["output_files"].extend([csv_path, html_path])
 
                 workbook_summary["sheets"].append({
                     "name": sheet_name,
@@ -236,19 +232,19 @@ def process_xlsx_with_pandas(file_path: Path, job_output_dir: Path) -> dict:
 
     except Exception as e:
         result["status"] = "failed"
-        result["errors"].append(f"XLSX fallback failed: {e}")
+        result["errors"].append(f"XLSX processing failed: {e}")
 
     return result
 
 
 # --------------------------------------------------
-# Docling processing
+# DOCX processing
 # --------------------------------------------------
-def process_with_docling(file_path: Path, job_output_dir: Path, converter) -> dict:
+def process_docx(file_path: Path, job_output_dir: Path) -> dict:
     result = {
         "file_name": file_path.name,
-        "file_type": file_path.suffix.lower().replace(".", ""),
-        "mode": "docling",
+        "file_type": "docx",
+        "mode": "python_docx",
         "status": "success",
         "preview_text": "",
         "tables": [],
@@ -256,75 +252,86 @@ def process_with_docling(file_path: Path, job_output_dir: Path, converter) -> di
         "errors": [],
     }
 
+    ok, err = check_docx_stack_available()
+    if not ok:
+        result["status"] = "failed"
+        result["errors"].append(f"DOCX stack import failed: {err}")
+        return result
+
     try:
-        conv_result = converter.convert(str(file_path))
-        doc = conv_result.document
+        import docx
 
-        try:
-            markdown_text = doc.export_to_markdown()
-            result["preview_text"] = markdown_text
-            md_path = job_output_dir / f"{file_path.stem}.md"
-            write_text_file(md_path, markdown_text)
-            result["output_files"].append(md_path)
-        except Exception as e:
-            result["errors"].append(f"Markdown export failed: {e}")
+        doc = docx.Document(str(file_path))
 
-        try:
-            if hasattr(doc, "export_to_dict"):
-                doc_dict = doc.export_to_dict()
-            elif hasattr(doc, "model_dump"):
-                doc_dict = doc.model_dump()
-            else:
-                doc_dict = {"note": "No direct dictionary export method available in this Docling version."}
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+        preview_text = "\n".join(paragraphs[:80])
+        result["preview_text"] = preview_text
 
-            json_path = job_output_dir / f"{file_path.stem}.json"
-            write_json_file(json_path, doc_dict)
-            result["output_files"].append(json_path)
-        except Exception as e:
-            result["errors"].append(f"JSON export failed: {e}")
+        md_path = job_output_dir / f"{file_path.stem}.md"
+        json_path = job_output_dir / f"{file_path.stem}.json"
 
-        tables = getattr(doc, "tables", []) or []
+        write_text_file(md_path, preview_text)
+        result["output_files"].append(md_path)
 
-        for idx, table in enumerate(tables, start=1):
-            table_info = {
-                "index": idx,
-                "name": f"Table {idx}",
-                "dataframe": None,
-                "csv_path": None,
-                "html_path": None,
-                "markdown": None,
-                "rows": None,
-                "columns": None,
-            }
+        doc_summary = {
+            "file": file_path.name,
+            "mode": result["mode"],
+            "paragraph_count": len(paragraphs),
+            "table_count": len(doc.tables),
+            "errors": [],
+        }
 
+        for idx, table in enumerate(doc.tables, start=1):
             try:
-                table_info["markdown"] = table.export_to_markdown()
-            except Exception:
-                table_info["markdown"] = f"### Table {idx}"
+                rows = []
+                max_cols = 0
 
-            try:
-                html_path = job_output_dir / f"{file_path.stem}_table_{idx}.html"
-                html_content = table.export_to_html()
-                write_text_file(html_path, html_content)
-                table_info["html_path"] = html_path
-                result["output_files"].append(html_path)
-            except Exception as e:
-                result["errors"].append(f"HTML export failed for table {idx}: {e}")
+                for row in table.rows:
+                    values = [cell.text.strip() for cell in row.cells]
+                    rows.append(values)
+                    max_cols = max(max_cols, len(values))
 
-            try:
-                df = table.export_to_dataframe()
-                table_info["dataframe"] = df
-                table_info["rows"] = len(df)
-                table_info["columns"] = len(df.columns)
+                normalized_rows = []
+                for row in rows:
+                    normalized_rows.append(row + [""] * (max_cols - len(row)))
+
+                if normalized_rows:
+                    header = normalized_rows[0]
+                    data_rows = normalized_rows[1:] if len(normalized_rows) > 1 else []
+                    if any(str(h).strip() for h in header):
+                        df = pd.DataFrame(data_rows, columns=header)
+                    else:
+                        df = pd.DataFrame(normalized_rows)
+                else:
+                    df = pd.DataFrame()
 
                 csv_path = job_output_dir / f"{file_path.stem}_table_{idx}.csv"
-                df.to_csv(csv_path, index=False)
-                table_info["csv_path"] = csv_path
-                result["output_files"].append(csv_path)
-            except Exception as e:
-                result["errors"].append(f"CSV export failed for table {idx}: {e}")
+                html_path = job_output_dir / f"{file_path.stem}_table_{idx}.html"
 
-            result["tables"].append(table_info)
+                df.to_csv(csv_path, index=False)
+                write_text_file(html_path, html_table_from_df(df))
+
+                table_info = {
+                    "index": idx,
+                    "name": f"Table {idx}",
+                    "dataframe": df,
+                    "csv_path": csv_path,
+                    "html_path": html_path,
+                    "markdown": dataframe_to_markdown_fallback(df, f"Table {idx}"),
+                    "rows": len(df),
+                    "columns": len(df.columns),
+                }
+
+                result["tables"].append(table_info)
+                result["output_files"].extend([csv_path, html_path])
+
+            except Exception as e:
+                msg = f"DOCX table {idx} failed: {e}"
+                result["errors"].append(msg)
+                doc_summary["errors"].append(msg)
+
+        write_json_file(json_path, doc_summary)
+        result["output_files"].append(json_path)
 
         if result["errors"] and not result["preview_text"] and not result["tables"]:
             result["status"] = "failed"
@@ -333,11 +340,154 @@ def process_with_docling(file_path: Path, job_output_dir: Path, converter) -> di
 
     except Exception as e:
         result["status"] = "failed"
-        result["errors"].append(f"Docling processing failed: {e}")
+        result["errors"].append(f"DOCX processing failed: {e}")
 
     return result
 
 
+# --------------------------------------------------
+# PDF processing with Camelot
+# --------------------------------------------------
+def extract_pdf_text(file_path: Path) -> tuple[str, list[str]]:
+    errors = []
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(file_path))
+        parts = []
+        for page in reader.pages[:25]:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception as e:
+                errors.append(f"PDF text extraction warning: {e}")
+
+        return "\n\n".join([p.strip() for p in parts if p and p.strip()]), errors
+    except Exception as e:
+        return "", [f"PDF text extraction failed: {e}"]
+
+
+def run_camelot(file_path: Path, flavor: str):
+    import camelot
+    return camelot.read_pdf(str(file_path), pages="all", flavor=flavor)
+
+
+def process_pdf_with_camelot(file_path: Path, job_output_dir: Path) -> dict:
+    result = {
+        "file_name": file_path.name,
+        "file_type": "pdf",
+        "mode": "camelot",
+        "status": "success",
+        "preview_text": "",
+        "tables": [],
+        "output_files": [],
+        "errors": [],
+    }
+
+    ok, err = check_pdf_stack_available()
+    if not ok:
+        result["status"] = "failed"
+        result["errors"].append(f"PDF stack import failed: {err}")
+        return result
+
+    preview_text, text_errors = extract_pdf_text(file_path)
+    result["preview_text"] = preview_text
+    result["errors"].extend(text_errors)
+
+    md_path = job_output_dir / f"{file_path.stem}.md"
+    write_text_file(md_path, preview_text or "No text preview available.")
+    result["output_files"].append(md_path)
+
+    extraction_summary = {
+        "file": file_path.name,
+        "mode": result["mode"],
+        "flavor_used": None,
+        "table_count": 0,
+        "errors": [],
+    }
+
+    tables_obj = None
+    used_flavor = None
+
+    # Try lattice first, then stream fallback
+    for flavor in ["lattice", "stream"]:
+        try:
+            candidate = run_camelot(file_path, flavor)
+            if len(candidate) > 0:
+                tables_obj = candidate
+                used_flavor = flavor
+                break
+        except Exception as e:
+            msg = f"Camelot {flavor} failed: {e}"
+            result["errors"].append(msg)
+            extraction_summary["errors"].append(msg)
+
+    # If lattice found 0 tables but no exception, try stream too
+    if tables_obj is None:
+        try:
+            candidate = run_camelot(file_path, "stream")
+            tables_obj = candidate
+            used_flavor = "stream"
+        except Exception as e:
+            msg = f"Camelot stream fallback failed: {e}"
+            result["errors"].append(msg)
+            extraction_summary["errors"].append(msg)
+
+    if tables_obj is not None:
+        extraction_summary["flavor_used"] = used_flavor
+        extraction_summary["table_count"] = len(tables_obj)
+
+        for idx, table in enumerate(tables_obj, start=1):
+            try:
+                df = table.df.copy()
+
+                # Try to use first row as header when it looks sensible
+                if not df.empty and len(df) > 1:
+                    first_row = [str(x).strip() for x in df.iloc[0].tolist()]
+                    unique_nonempty = len(set([x for x in first_row if x]))
+                    if unique_nonempty >= 1:
+                        df.columns = first_row
+                        df = df.iloc[1:].reset_index(drop=True)
+
+                csv_path = job_output_dir / f"{file_path.stem}_table_{idx}.csv"
+                html_path = job_output_dir / f"{file_path.stem}_table_{idx}.html"
+
+                df.to_csv(csv_path, index=False)
+                write_text_file(html_path, html_table_from_df(df))
+
+                table_info = {
+                    "index": idx,
+                    "name": f"Table {idx} ({used_flavor})",
+                    "dataframe": df,
+                    "csv_path": csv_path,
+                    "html_path": html_path,
+                    "markdown": dataframe_to_markdown_fallback(df, f"Table {idx}"),
+                    "rows": len(df),
+                    "columns": len(df.columns),
+                }
+
+                result["tables"].append(table_info)
+                result["output_files"].extend([csv_path, html_path])
+
+            except Exception as e:
+                msg = f"PDF table {idx} failed: {e}"
+                result["errors"].append(msg)
+                extraction_summary["errors"].append(msg)
+
+    json_path = job_output_dir / f"{file_path.stem}.json"
+    write_json_file(json_path, extraction_summary)
+    result["output_files"].append(json_path)
+
+    if result["errors"] and not result["preview_text"] and not result["tables"]:
+        result["status"] = "failed"
+    elif result["errors"]:
+        result["status"] = "partial_success"
+
+    return result
+
+
+# --------------------------------------------------
+# Router
+# --------------------------------------------------
 def process_file(file_path: Path):
     job_output_dir = get_job_output_dir(file_path)
     suffix = file_path.suffix.lower()
@@ -345,34 +495,22 @@ def process_file(file_path: Path):
     if suffix == ".xlsx":
         return process_xlsx_with_pandas(file_path, job_output_dir)
 
-    ok, err = check_docling_available()
-    if not ok:
-        return {
-            "file_name": file_path.name,
-            "file_type": suffix.replace(".", ""),
-            "mode": "docling",
-            "status": "failed",
-            "preview_text": "",
-            "tables": [],
-            "output_files": [],
-            "errors": [f"Docling import failed before processing: {err}"],
-        }
+    if suffix == ".pdf":
+        return process_pdf_with_camelot(file_path, job_output_dir)
 
-    try:
-        converter = get_converter()
-    except Exception as e:
-        return {
-            "file_name": file_path.name,
-            "file_type": suffix.replace(".", ""),
-            "mode": "docling",
-            "status": "failed",
-            "preview_text": "",
-            "tables": [],
-            "output_files": [],
-            "errors": [f"Docling converter initialization failed: {e}"],
-        }
+    if suffix == ".docx":
+        return process_docx(file_path, job_output_dir)
 
-    return process_with_docling(file_path, job_output_dir, converter)
+    return {
+        "file_name": file_path.name,
+        "file_type": suffix.replace(".", ""),
+        "mode": "unsupported",
+        "status": "failed",
+        "preview_text": "",
+        "tables": [],
+        "output_files": [],
+        "errors": [f"Unsupported file type: {suffix}"],
+    }
 
 
 # --------------------------------------------------
@@ -384,14 +522,21 @@ with st.sidebar:
     max_preview_chars = st.slider("Preview length", min_value=1000, max_value=15000, value=4000, step=500)
     st.markdown("---")
     st.info("Tip: Start with 3-5 real files from your own use case.")
-    st.caption("PDF OCR is currently disabled for better Cloud compatibility.")
+    st.caption("PDFs use Camelot for tables and PyPDF for text preview.")
 
-    docling_ok, docling_err = check_docling_available()
-    if docling_ok:
-        st.success("Docling import check passed")
+    pdf_ok, pdf_err = check_pdf_stack_available()
+    if pdf_ok:
+        st.success("PDF stack import check passed")
     else:
-        st.error("Docling import check failed")
-        st.code(docling_err)
+        st.error("PDF stack import check failed")
+        st.code(pdf_err)
+
+    docx_ok, docx_err = check_docx_stack_available()
+    if docx_ok:
+        st.success("DOCX stack import check passed")
+    else:
+        st.error("DOCX stack import check failed")
+        st.code(docx_err)
 
 
 # --------------------------------------------------
@@ -542,7 +687,7 @@ if process_clicked and uploaded_files:
             st.download_button(
                 label="📦 Download all generated outputs as ZIP",
                 data=zip_buffer,
-                file_name=f"docling_mvp_outputs_{now_stamp()}.zip",
+                file_name=f"table_extractor_outputs_{now_stamp()}.zip",
                 mime="application/zip"
             )
         else:
