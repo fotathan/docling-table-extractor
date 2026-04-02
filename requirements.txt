@@ -2,3 +2,4 @@ docling
 pandas
 openpyxl
 xlsxwriter
+opencv-python-headless
