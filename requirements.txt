@@ -2,5 +2,6 @@ streamlit==1.55.0
 pandas
 openpyxl
 xlsxwriter
+
 docling
 opencv-python-headless
