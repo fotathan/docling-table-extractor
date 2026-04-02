@@ -45,8 +45,8 @@ with st.container():
         **Cloud-safe mode**
         - Docling is loaded only when needed
         - OCR is disabled for PDFs
-        - best for text-based PDFs
-        - custom artifacts path is not used
+        - extra PDF AI steps are reduced where supported
+        - best for text-based PDFs on Streamlit Cloud
         """
     )
 
@@ -103,10 +103,11 @@ def get_job_output_dir(file_path: Path) -> Path:
 def get_converter():
     """
     Lazy-load Docling only when needed.
-    OCR is disabled for Streamlit Cloud stability.
-    Intentionally do NOT set a custom artifacts_path here,
-    because an incomplete local artifacts folder can trigger:
-    'Missing safe tensors file: docling_artifacts/model.safetensors'
+
+    Streamlit Cloud friendly settings:
+    - disable OCR
+    - disable heavy PDF model steps when those flags exist
+    - do NOT set a custom artifacts_path
     """
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -114,6 +115,23 @@ def get_converter():
 
     pdf_options = PdfPipelineOptions()
     pdf_options.do_ocr = False
+
+    # Different Docling versions expose slightly different option names.
+    # Turn off heavier model-based PDF steps when available.
+    if hasattr(pdf_options, "do_table_structure"):
+        pdf_options.do_table_structure = False
+
+    if hasattr(pdf_options, "do_layout_analysis"):
+        pdf_options.do_layout_analysis = False
+
+    if hasattr(pdf_options, "do_formula_enrichment"):
+        pdf_options.do_formula_enrichment = False
+
+    if hasattr(pdf_options, "generate_picture_images"):
+        pdf_options.generate_picture_images = False
+
+    if hasattr(pdf_options, "generate_table_images"):
+        pdf_options.generate_table_images = False
 
     return DocumentConverter(
         format_options={
